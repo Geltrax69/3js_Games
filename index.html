@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Dungeon Delve</title>
+<style>
+  :root { --gold: #d8a93f; --gold-dim: #8a6a24; --bg: #060608; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg);
+    font-family: Georgia, 'Times New Roman', serif; color: #e8dcc0; }
+  canvas.game { position: fixed; inset: 0; display: block; }
+  .overlay { position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; z-index: 10; }
+  .hidden { display: none !important; }
+  .title { font-size: 52px; letter-spacing: 10px; color: var(--gold);
+    text-shadow: 0 0 24px rgba(216,169,63,.35), 0 2px 0 #000; margin-bottom: 10px; }
+  .subtitle { font-size: 15px; letter-spacing: 3px; color: #9a8f74; margin-bottom: 26px; }
+  button { font-family: inherit; font-size: 17px; letter-spacing: 3px; cursor: pointer;
+    color: #1a1206; background: linear-gradient(180deg, #e9c25c, #b9862f);
+    border: 1px solid #6e4f16; border-radius: 6px; padding: 13px 34px; margin: 8px;
+    box-shadow: 0 0 18px rgba(216,169,63,.25); transition: transform .12s, box-shadow .12s; }
+  button:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 0 26px rgba(216,169,63,.5); }
+  button:disabled { opacity: .35; cursor: default; }
+  button.ghost { background: transparent; color: var(--gold); border: 1px solid var(--gold-dim); box-shadow: none; }
+  /* loading */
+  #loading { background: radial-gradient(ellipse at center, #0c0a08 0%, #060608 70%); z-index: 40; }
+  #loading .bar { width: 320px; height: 10px; border: 1px solid var(--gold-dim);
+    border-radius: 5px; overflow: hidden; margin-top: 8px; }
+  #loadfill { height: 100%; width: 0%; background: linear-gradient(90deg, #8a6a24, var(--gold)); }
+  #loadtext { margin-top: 12px; font-size: 13px; letter-spacing: 2px; color: #9a8f74; }
+  /* select */
+  #select { justify-content: flex-end; pointer-events: none; padding-bottom: 34px;
+    background: linear-gradient(180deg, transparent 55%, rgba(0,0,0,.72) 100%); }
+  #select .title { font-size: 34px; letter-spacing: 8px; }
+  #select > * { pointer-events: auto; }
+  #charname { font-size: 20px; letter-spacing: 4px; color: #fff; min-height: 30px; margin-bottom: 6px;
+    text-shadow: 0 2px 6px #000; }
+  #select .hint { margin-top: 14px; font-size: 13px; letter-spacing: 2px; color: #9a8f74; pointer-events: none; }
+  /* hud */
+  #hud { position: fixed; inset: 0; z-index: 10; pointer-events: none; }
+  #timer { position: absolute; top: 14px; left: 18px; font-size: 26px; letter-spacing: 3px;
+    color: var(--gold); text-shadow: 0 2px 4px #000; }
+  #steps { position: absolute; top: 48px; left: 18px; font-size: 14px; letter-spacing: 2px; color: #9a8f74; }
+  #minimap { position: absolute; top: 14px; right: 14px; border: 1px solid var(--gold-dim);
+    border-radius: 4px; background: rgba(0,0,0,.55); }
+  #hintarrow { position: absolute; top: 16px; left: 50%; margin-left: -18px; width: 36px; height: 36px;
+    font-size: 30px; line-height: 36px; text-align: center; color: var(--gold);
+    text-shadow: 0 0 12px rgba(216,169,63,.8); transition: transform .1s linear; }
+  #hintlabel { position: absolute; top: 52px; left: 50%; transform: translateX(-50%);
+    font-size: 11px; letter-spacing: 3px; color: #9a8f74; }
+  #toast { position: absolute; bottom: 90px; left: 50%; transform: translateX(-50%);
+    font-size: 18px; letter-spacing: 3px; color: #ffe9b0; text-shadow: 0 2px 8px #000;
+    opacity: 0; transition: opacity .4s; background: rgba(0,0,0,.55); padding: 10px 22px;
+    border: 1px solid var(--gold-dim); border-radius: 6px; }
+  #controls-hint { position: absolute; bottom: 14px; left: 18px; font-size: 12px;
+    letter-spacing: 1.5px; color: #6f6650; }
+  /* win */
+  #win { background: rgba(4,3,2,.82); z-index: 30; }
+  #win .title { font-size: 64px; }
+  #wintime, #winsteps { font-size: 20px; letter-spacing: 3px; color: #e8dcc0; margin: 6px; }
+  #win .row { margin-top: 18px; }
+  #fader { position: fixed; inset: 0; background: #000; opacity: 1; transition: opacity .8s;
+    z-index: 35; pointer-events: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+  <div id="fader"></div>
+
+  <div id="loading" class="overlay">
+    <div class="title">DUNGEON DELVE</div>
+    <div class="subtitle">A TINY THREE.JS DUNGEON CRAWLER</div>
+    <div class="bar"><div id="loadfill"></div></div>
+    <div id="loadtext">SUMMONING ASSETS…</div>
+  </div>
+
+  <div id="select" class="overlay hidden">
+    <div class="title">CHOOSE YOUR DELVER</div>
+    <div id="charname"></div>
+    <button id="startBtn" disabled>ENTER THE DUNGEON</button>
+    <div class="hint">CLICK A CHARACTER TO INSPECT &nbsp;•&nbsp; DRAG TO LOOK AROUND</div>
+  </div>
+
+  <div id="hud" class="hidden">
+    <div id="timer">00:00</div>
+    <div id="steps">0 STEPS</div>
+    <canvas id="minimap" width="156" height="54"></canvas>
+    <div id="hintarrow">▲</div>
+    <div id="hintlabel">EXIT</div>
+    <div id="toast"></div>
+    <div id="controls-hint">WASD MOVE &nbsp;•&nbsp; SHIFT SPRINT &nbsp;•&nbsp; CLICK FLOOR TO WALK &nbsp;•&nbsp; DRAG MOUSE TO ORBIT &nbsp;•&nbsp; O = DEBUG CAM</div>
+  </div>
+
+  <div id="win" class="overlay hidden">
+    <div class="title">ESCAPED!</div>
+    <div class="subtitle">YOU FOUND THE WAY OUT</div>
+    <div id="wintime"></div>
+    <div id="winsteps"></div>
+    <div class="row">
+      <button id="againBtn">PLAY AGAIN</button>
+      <button id="changeBtn" class="ghost">CHANGE CHARACTER</button>
+    </div>
+  </div>
+
+<script type="module" src="main.js"></script>
+</body>
+</html>

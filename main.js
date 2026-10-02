@@ -16,42 +16,57 @@ const CHARACTERS = 'abcdefghijklmnopqr'.split(''); // 18 characters: a..r
 
 // ---------------- Dungeon layout (EDIT ME) ----------------
 // One character per TILE. Row = +z (south), col = +x (east).
-//   S start room 3x3 | L large room 5x5 | W wide room 5x3 | F finish room 5x5 (large)
+//   S start room 3x3 | L large room 5x5 | W wide room 5x3 | F finish room 5x5
 //   - corridor (auto-picks straight/corner/end/junction/intersection + rotation)
-//   J junction (3-way) | X intersection (4-way, forced)
-//   G locked gate (gate-metal-bars, opens via floor switch)
-//   T stairs, 2x1 tiles, anchor = west tile, ascends eastward
-//   P floor switch (walkable room floor + pressure plate)
+//   G locked gate (in a 1-wide corridor, opens via floor switch P)
+//   T stairs, 2x1 tiles (decorative, placed against a wall inside room L)
+//   P floor switch (treated as part of room W for room detection)
 //   . empty
+//
+// Route: S -up-> junction (-west-> dead end) -east-> L -east-> corner -south->
+//        W (switch P) -east-> gate G -east-> F (flag). All room connections go
+//        through real doorways measured from the room GLBs (see ROOM_DEFS).
 const LAYOUT = [
-  ".......LLLLL..............",
-  ".SSS...LLLLL..............",
-  ".SSS--JLLLLL--............",
-  ".SSS..-LLLLL.-............",
-  "......-LLLLL.-.......FFFFF",
-  "...........WWWPW.....FFFFF",
-  "...........WWWWW-G-..FFFFF",
-  "...........WWWWW.....FFFFF",
-  ".....................FFFFF",
+  ".........................",
+  ".........................",
+  ".........................",
+  ".......LLLTL.............",
+  ".......LLLTL.............",
+  ".------LLLLL--...........",
+  "...-...LLLLL.-...........",
+  "...-...LLLLL.-.....FFFFF.",
+  "..SSS......WWWWW...FFFFF.",
+  "..SSS......WWPWW-G-FFFFF.",
+  "..SSS......WWWWW...FFFFF.",
+  "...................FFFFF.",
+  ".........................",
 ];
+// Doorway tile indices per side, measured from the actual room GLBs by
+// raycasting each face (see /tmp/gametest/measure.js): every room piece has
+// one centered doorway (~3 units wide) on each side, sitting fully inside the
+// middle tile of that side. Dirs: 0=E(+x) 1=W(-x) 2=S(+z) 3=N(-z).
 const ROOM_DEFS = {
-  S: { piece: 'room-small', w: 3, h: 3 },
-  L: { piece: 'room-large', w: 5, h: 5 },
-  W: { piece: 'room-wide',  w: 5, h: 3 },
-  F: { piece: 'room-large', w: 5, h: 5 }, // finish room
+  S: { piece: 'room-small', w: 3, h: 3, doors: { 0: [1], 1: [1], 2: [1], 3: [1] } },
+  L: { piece: 'room-large', w: 5, h: 5, doors: { 0: [2], 1: [2], 2: [2], 3: [2] } },
+  W: { piece: 'room-wide',  w: 5, h: 3, doors: { 0: [1], 1: [1], 2: [2], 3: [2] } },
+  F: { piece: 'room-large', w: 5, h: 5, doors: { 0: [2], 1: [2], 2: [2], 3: [2] } },
 };
-const PIECE_FILES = { // glb file per piece key (+ variations unused for now)
+const PIECE_FILES = {
   'room-small': 'room-small.glb', 'room-large': 'room-large.glb', 'room-wide': 'room-wide.glb',
   'corridor': 'corridor.glb', 'corridor-corner': 'corridor-corner.glb',
   'corridor-end': 'corridor-end.glb', 'corridor-junction': 'corridor-junction.glb',
   'corridor-intersection': 'corridor-intersection.glb',
   'gate-metal-bars': 'gate-metal-bars.glb', 'stairs': 'stairs.glb',
 };
+// Measured default openings (rotation.y = 0) of corridor pieces:
+//   corridor: E+W | corridor-end: E | corridor-corner: N+W
+//   corridor-junction: N+E+W (wall S) | corridor-intersection: all four
 
 // ---------------- Tunables ----------------
-const WALK_SPEED = 3.4, SPRINT_SPEED = 6.8, PLAYER_RADIUS = 0.45;
-const CAM_DIST = 8, CAM_MIN = 3.5, CAM_MAX = 13;
+const WALK_SPEED = 4.2, SPRINT_SPEED = 7.5, PLAYER_RADIUS = 0.45;
+const CAM_DIST = 9, CAM_PITCH = 0.6, CAM_MIN = 4, CAM_MAX = 14;
 const STEP_LENGTH = 0.8; // world units per counted step
+const WIN_DIST = 1.2;
 
 // ---------------- Globals ----------------
 let renderer, clock;
@@ -62,7 +77,7 @@ let pieceTemplates = {};            // piece key -> Object3D template
 let charCache = {};                 // 'a'..'r' -> { gltf, height }
 let state = 'loading';              // loading | select | playing | won
 let selectedChar = null;            // chosen letter
-let selectChars = [];               // {letter, group, mixer, platform}
+let selectChars = [];               // {letter, group, mixer, ring, baseX, baseZ}
 let selectRaycaster = new THREE.Raycaster();
 let selectPointer = new THREE.Vector2();
 let selCamGoal = null;              // camera tween target on select screen
@@ -70,20 +85,29 @@ let selDrag = null;
 
 // game state
 let player = null;                  // {group, mixer, actions, yaw}
-let walkGrid = [];                  // [z][x] -> true walkable
-let gateTile = null, gateGroup = null, gateOpen = false, gateAnim = 0;
-let switchPos = null, switchGroup = null, switchTop = null, switchOn = false;
-let startPos = null, flagPos = null, flagMesh = null, flagBase = null, flagLight = null;
-let torches = [];                   // {light, base, phase}
-let dungeonGroup = null, colliderMeshes = [];
-let camYaw = -Math.PI / 2, camPitch = 0.42, camDist = CAM_DIST;
-let keys = {}, clickTarget = null;
-let moveDir = new THREE.Vector3();
+let cellKind = [];                  // [z][x] -> 'room'|'corr'|'gate'|'stairs'|null
+let cellRoom = [];                  // [z][x] -> room index or -1
+let rooms = [];                     // {letter,x0,z0,w,h,doors}
+let openE = [];                     // [z][x] -> bitmask of open edges (bit d: DIRS[d])
+let visited = [];                   // [z][x] -> fog-of-war on minimap
+let gateTile = null, gateGroup = null, gateOpen = false, gateAnim = 0, gateOpenBits = 0;
+let switchPos = null, switchCell = null, switchGroup = null, switchTop = null, switchOn = false;
+let startPos = null, startCell = null, flagPos = null, flagCell = null;
+let flagMesh = null, flagBase = null, flagLight = null;
+let torches = [];                   // {light, flame, base, phase}
+let dungeonGroup = null, occluderMeshes = [];
+let camYaw = 0, camPitch = CAM_PITCH, camDist = CAM_DIST, lastDragT = -10;
+let keys = {};
+let clickPath = null, clickIdx = 0, clickPoint = null; // A* click-to-move state
+let clickMarker = null, pathLine = null;
 let startTime = 0, elapsed = 0, totalDist = 0, stepCount = 0;
 let winTimer = 0, won = false;
-let debugOrbit = null, debugOn = false;
+let debugOrbit = null, debugOn = false, debugOverlay = null;
 let animState = 'idle';
-let toastTimer = 0;
+let toastTimer = 0, hintTimer = 0, hintDir = null;
+
+const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]]; // 0=E(+x) 1=W(-x) 2=S(+z) 3=N(-z)
+const OPP = [1, 0, 3, 2];
 
 const $ = id => document.getElementById(id);
 const loader = new GLTFLoader();
@@ -141,25 +165,20 @@ async function loadAll() {
     partial.push(loadGLB(j.url).then(gltf => {
       if (j.kind === 'piece') pieceTemplates[j.key] = gltf.scene;
       else {
-        const h = new THREE.Box3().setFromObject(gltf.scene).max.y - new THREE.Box3().setFromObject(gltf.scene).min.y;
-        charCache[j.key] = { gltf, height: h };
+        const box = new THREE.Box3().setFromObject(gltf.scene);
+        charCache[j.key] = { gltf, height: box.max.y - box.min.y };
       }
       done++;
       $('loadfill').style.width = (done / jobs.length * 100).toFixed(1) + '%';
       $('loadtext').textContent = `SUMMONING ASSETS… ${done}/${jobs.length}`;
     }));
-    // load a few at a time so the progress bar paints
     if (partial.length % 4 === 0) await Promise.all(partial.splice(0));
   }
   await Promise.all(partial);
 
-  // Measure the grid tile size from a room + a corridor (bounding boxes).
-  const roomBox = new THREE.Box3().setFromObject(pieceTemplates['room-small']);
   const corBox = new THREE.Box3().setFromObject(pieceTemplates['corridor']);
-  const roomSize = roomBox.max.x - roomBox.min.x;   // 12 -> 3 tiles
-  const corSize = corBox.max.x - corBox.min.x;      // 4  -> 1 tile
-  TILE = corSize;
-  console.log(`tile=${TILE}, room-small=${roomSize} (${(roomSize / TILE).toFixed(1)} tiles)`);
+  TILE = corBox.max.x - corBox.min.x; // 4 -> 1 tile
+  console.log(`tile=${TILE}`);
 
   MAP_W = LAYOUT[0].length; MAP_H = LAYOUT.length;
   OFF_X = MAP_W * TILE / 2; OFF_Z = MAP_H * TILE / 2;
@@ -173,9 +192,18 @@ function tileToWorld(tx, tz, out) {
 function worldToTile(x, z) {
   return [Math.floor((x + OFF_X) / TILE), Math.floor((z + OFF_Z) / TILE)];
 }
+function inBounds(tx, tz) { return tx >= 0 && tz >= 0 && tx < MAP_W && tz < MAP_H; }
 function isWalkable(tx, tz) {
-  if (tx < 0 || tz < 0 || tx >= MAP_W || tz >= MAP_H) return false;
-  return !!walkGrid[tz][tx];
+  if (!inBounds(tx, tz)) return false;
+  const k = cellKind[tz][tx];
+  return k === 'room' || k === 'corr' || k === 'gate';
+}
+// Edge-based crossing test: may the player step from cell a to adjacent cell b?
+function edgeOpenBetween(ax, az, bx, bz) {
+  if (!inBounds(bx, bz)) return false;
+  const dx = bx - ax, dz = bz - az;
+  const d = dx === 1 ? 0 : dx === -1 ? 1 : dz === 1 ? 2 : 3;
+  return ((openE[az][ax] >> d) & 1) === 1 && ((openE[bz][bx] >> OPP[d]) & 1) === 1;
 }
 
 // Normalize a character so it stands ~1.7 units tall, feet at y=0, centered.
@@ -237,14 +265,12 @@ function buildSelectScreen() {
     const idle = clipByName(charCache[letter].gltf, ['idle']);
     if (idle) mixer.clipAction(idle).play();
     group.traverse(o => { o.userData.charLetter = letter; });
-    selectChars.push({ letter, group, mixer, ring, baseX: cx, baseZ: cz, spin: Math.random() * Math.PI * 2 });
+    selectChars.push({ letter, group, mixer, ring, baseX: cx, baseZ: cz });
   });
 
-  // frame all 18
   selectCamera.position.set(0, 9.5, 15.5);
   selectCamera.lookAt(0, 1.2, 0.6);
 
-  // picking + drag-look
   const el = renderer.domElement;
   el.addEventListener('pointerdown', e => {
     if (state !== 'select') return;
@@ -280,21 +306,16 @@ function chooseCharacter(letter) {
   const c = selectChars.find(c => c.letter === letter);
   $('charname').textContent = 'CHARACTER ' + letter.toUpperCase();
   $('startBtn').disabled = false;
-  // tween camera in for a closer look
-  selCamGoal = {
-    target: new THREE.Vector3(c.baseX, 1.3, c.baseZ),
-    dist: 6.2, elev: 0.32, azimuth: null, // keep current azimuth
-  };
-  selTargetGoal.copy(selCamGoal.target);
+  selCamGoal = { dist: 6.2, elev: 0.32 };
+  selTargetGoal.set(c.baseX, 1.3, c.baseZ);
 }
 const selTargetGoal = new THREE.Vector3(0, 1.2, 0.6);
 
-function updateSelect(dt, t) {
+function updateSelect(dt) {
   for (const c of selectChars) {
     c.mixer.update(dt);
-    if (c.letter !== selectedChar) c.group.rotation.y += dt * 0.55; // slow turntable
+    if (c.letter !== selectedChar) c.group.rotation.y += dt * 0.55;
   }
-  // camera drift / tween
   selTarget.lerp(selTargetGoal, 1 - Math.pow(0.001, dt));
   const dGoal = selCamGoal ? selCamGoal.dist : 18.5;
   const eGoal = selCamGoal ? selCamGoal.elev : 0.62;
@@ -310,8 +331,107 @@ function updateSelect(dt, t) {
 }
 
 /* ================= DUNGEON BUILD ================= */
-// Parse LAYOUT into piece placements, auto-rotating corridors from neighbor masks.
-// Returns nothing; fills walkGrid, gateTile, switchPos, startPos, flagPos.
+// Parse LAYOUT once per room block (top-left anchor only). 'P' counts as 'W'.
+function parseLayout() {
+  cellKind = Array.from({ length: MAP_H }, () => new Array(MAP_W).fill(null));
+  cellRoom = Array.from({ length: MAP_H }, () => new Array(MAP_W).fill(-1));
+  visited = Array.from({ length: MAP_H }, () => new Array(MAP_W).fill(false));
+  rooms = [];
+  const claimed = Array.from({ length: MAP_H }, () => new Array(MAP_W).fill(false));
+  const roomCharAt = (x, z) => {
+    const ch = LAYOUT[z][x];
+    return ch === 'P' ? 'W' : ch;
+  };
+  // a layout cell belongs to room `ch` if it carries that letter, is the
+  // switch inside a W room, or is a (decorative) stairs tile inside the room
+  const matchesRoom = (x, z, ch) => {
+    const c = LAYOUT[z][x];
+    return c === ch || (c === 'P' && ch === 'W') || c === 'T';
+  };
+  for (let z = 0; z < MAP_H; z++) for (let x = 0; x < MAP_W; x++) {
+    if (claimed[z][x]) continue;
+    const ch = roomCharAt(x, z);
+    const def = ROOM_DEFS[ch];
+    if (!def) continue;
+    // validate the block is exactly w x h
+    let ok = true;
+    for (let dz = 0; dz < def.h && ok; dz++) for (let dx = 0; dx < def.w && ok; dx++) {
+      if (!inBounds(x + dx, z + dz) || !matchesRoom(x + dx, z + dz, ch)) ok = false;
+    }
+    if (!ok) {
+      console.error(`ROOM BLOCK MISMATCH: '${ch}' at (${x},${z}) is not exactly ${def.w}x${def.h} (cell char='${LAYOUT[z][x]}')`);
+      continue;
+    }
+    const idx = rooms.length;
+    rooms.push({ letter: ch, x0: x, z0: z, w: def.w, h: def.h, doors: def.doors });
+    for (let dz = 0; dz < def.h; dz++) for (let dx = 0; dx < def.w; dx++) {
+      claimed[z + dz][x + dx] = true;
+      cellKind[z + dz][x + dx] = 'room';
+      cellRoom[z + dz][x + dx] = idx;
+    }
+    if (ch === 'S') { startCell = [x + 1, z + 1]; startPos = tileToWorld(x + 1, z + 1); }
+    if (ch === 'F') { flagCell = [x + 2, z + 2]; flagPos = tileToWorld(x + 2, z + 2); }
+  }
+  if (!startPos) console.error('LAYOUT has no S room');
+  if (!flagPos) console.error('LAYOUT has no F room');
+
+  for (let z = 0; z < MAP_H; z++) for (let x = 0; x < MAP_W; x++) {
+    const ch = LAYOUT[z][x];
+    if (ch === 'P') { switchCell = [x, z]; switchPos = tileToWorld(x, z); }
+    else if (ch === 'G') { gateTile = [x, z]; cellKind[z][x] = 'gate'; }
+    else if (ch === 'T') cellKind[z][x] = 'stairs'; // one blocked cell per T tile
+    else if (ch === '-' || ch === 'J' || ch === 'X') cellKind[z][x] = 'corr';
+  }
+  if (!switchPos) console.error('LAYOUT has no P switch');
+  if (!gateTile) console.error('LAYOUT has no G gate');
+}
+
+// Build the per-cell edge bitmask. An edge is open only at real doorways
+// (room sides) or between connected corridor cells. Both sides of an edge
+// must be open for crossing (see edgeOpenBetween).
+function computeEdges() {
+  openE = Array.from({ length: MAP_H }, () => new Array(MAP_W).fill(0));
+  const roomSideTile = (R, side, x, z) => {
+    const onSide =
+      (side === 0 && x === R.x0 + R.w - 1) || (side === 1 && x === R.x0) ||
+      (side === 2 && z === R.z0 + R.h - 1) || (side === 3 && z === R.z0);
+    if (!onSide) return -1;
+    return (side === 0 || side === 1) ? z - R.z0 : x - R.x0;
+  };
+  for (let z = 0; z < MAP_H; z++) for (let x = 0; x < MAP_W; x++) {
+    const kind = cellKind[z][x];
+    if (!kind || kind === 'stairs') continue;
+    let bits = 0;
+    for (let d = 0; d < 4; d++) {
+      const nx = x + DIRS[d][0], nz = z + DIRS[d][1];
+      if (!inBounds(nx, nz)) continue;
+      const nk = cellKind[nz][nx];
+      if (!nk || nk === 'stairs') continue;
+      if (kind === 'room') {
+        if (cellRoom[nz][nx] === cellRoom[z][x]) bits |= (1 << d); // interior
+        else if (nk === 'corr' || nk === 'gate') {
+          const R = rooms[cellRoom[z][x]];
+          const ti = roomSideTile(R, d, x, z);
+          if (ti >= 0 && R.doors[d].includes(ti)) bits |= (1 << d);
+        }
+      } else { // corr or gate
+        if (nk === 'corr' || nk === 'gate') bits |= (1 << d);
+        else if (nk === 'room') {
+          const R = rooms[cellRoom[nz][nx]];
+          const ti = roomSideTile(R, OPP[d], nx, nz);
+          if (ti >= 0 && R.doors[OPP[d]].includes(ti)) bits |= (1 << d);
+        }
+      }
+    }
+    openE[z][x] = bits;
+  }
+  // the gate starts closed: remember its open bits, zero them for now
+  if (gateTile) {
+    gateOpenBits = openE[gateTile[1]][gateTile[0]];
+    openE[gateTile[1]][gateTile[0]] = 0;
+  }
+}
+
 function buildDungeon() {
   gameScene = new THREE.Scene();
   gameScene.background = new THREE.Color(0x05060a);
@@ -319,94 +439,74 @@ function buildDungeon() {
   gameCamera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 300);
   dungeonGroup = new THREE.Group();
   gameScene.add(dungeonGroup);
-  colliderMeshes = [];
-  walkGrid = Array.from({ length: MAP_H }, () => new Array(MAP_W).fill(false));
+  occluderMeshes = [];
 
   gameScene.add(new THREE.AmbientLight(0x2a2438, 0.5));
-  const hemi = new THREE.HemisphereLight(0x3a3f5a, 0x0a0805, 0.35);
-  gameScene.add(hemi);
+  gameScene.add(new THREE.HemisphereLight(0x3a3f5a, 0x0a0805, 0.35));
 
-  const placements = []; // {piece, ax, az, w, h, rotY, off:[x,y,z]}
+  parseLayout();
+  computeEdges();
 
-  // pass 1: rooms, stairs, gate, switch — mark walkable footprints
-  const claim = (ax, az, w, h) => {
-    for (let dz = 0; dz < h; dz++) for (let dx = 0; dx < w; dx++) {
-      const tx = ax + dx, tz = az + dz;
-      if (tx >= 0 && tz >= 0 && tx < MAP_W && tz < MAP_H) walkGrid[tz][tx] = true;
-    }
-  };
+  const placements = []; // {piece, cx, cz (center tile coords), rotY}
+  const roomPlaced = new Set();
   for (let z = 0; z < MAP_H; z++) for (let x = 0; x < MAP_W; x++) {
-    const ch = LAYOUT[z][x];
-    if (ROOM_DEFS[ch]) {
-      const d = ROOM_DEFS[ch];
-      placements.push({ piece: d.piece, ax: x, az: z, w: d.w, h: d.h, rotY: 0, off: [0, 0, 0] });
-      claim(x, z, d.w, d.h);
-      if (ch === 'S') startPos = tileToWorld(x + 1, z + 1);       // room-small center tile
-      if (ch === 'F') flagPos = tileToWorld(x + 2, z + 2);        // room-large center tile
-    } else if (ch === 'T') {
-      placements.push({ piece: 'stairs', ax: x, az: z, w: 2, h: 1, rotY: -Math.PI / 2, off: [-2, -7.3, 0] });
-      claim(x, z, 2, 1);
-    } else if (ch === 'G') {
-      gateTile = [x, z];
-      placements.push({ piece: 'gate-metal-bars', ax: x, az: z, w: 1, h: 1, rotY: Math.PI / 2, off: [0, 0, 0], gate: true });
-      claim(x, z, 1, 1); // walkable for connectivity, but blocked until opened
-    } else if (ch === 'P') {
-      claim(x, z, 1, 1);
-      switchPos = tileToWorld(x, z);
+    const kind = cellKind[z][x];
+    if (kind === 'room') {
+      const ri = cellRoom[z][x];
+      if (roomPlaced.has(ri)) continue;
+      roomPlaced.add(ri);
+      const R = rooms[ri];
+      placements.push({
+        piece: ROOM_DEFS[R.letter].piece,
+        cx: R.x0 + R.w / 2, cz: R.z0 + R.h / 2, rotY: 0,
+      });
+    } else if (kind === 'corr' || kind === 'gate') {
+      if (kind === 'gate') {
+        placements.push({ piece: 'gate-metal-bars', cx: x + 0.5, cz: z + 0.5, rotY: Math.PI / 2, gate: true });
+        continue;
+      }
+      // resolve corridor piece + rotation from open-edge mask
+      const bits = openE[z][x];
+      const n = bits & (1 << 3), e = bits & (1 << 0), s = bits & (1 << 2), w = bits & (1 << 1);
+      const count = [n, e, s, w].filter(Boolean).length;
+      let piece = 'corridor', rotY = 0;
+      if (count >= 4) piece = 'corridor-intersection';
+      else if (count === 3) {
+        piece = 'corridor-junction'; // default openings N+E+W (wall S)
+        if (!s) rotY = 0; else if (!n) rotY = Math.PI;
+        else if (!e) rotY = Math.PI / 2; else rotY = -Math.PI / 2;
+      } else if (count <= 1) {
+        piece = 'corridor-end'; // default opening faces E
+        if (e) rotY = 0; else if (w) rotY = Math.PI;
+        else if (s) rotY = -Math.PI / 2; else rotY = Math.PI / 2;
+      } else if ((n && s) || (e && w)) {
+        piece = 'corridor'; // default runs E-W
+        rotY = (n && s) ? Math.PI / 2 : 0;
+      } else {
+        piece = 'corridor-corner'; // default openings N+W (measured)
+        if (n && w) rotY = 0; else if (w && s) rotY = Math.PI / 2;
+        else if (s && e) rotY = Math.PI; else rotY = -Math.PI / 2;
+      }
+      placements.push({ piece, cx: x + 0.5, cz: z + 0.5, rotY });
+    } else if (kind === 'stairs' && LAYOUT[z][x] === 'T') {
+      if (z > 0 && LAYOUT[z - 1][x] === 'T') continue; // only the northernmost T anchors the model
+      let depth = 1;
+      while (z + depth < MAP_H && LAYOUT[z + depth][x] === 'T') depth++;
+      // decorative stairs: 1 tile wide (x), `depth` tiles deep (z), low end north
+      placements.push({ piece: 'stairs', cx: x + 0.5, cz: z + depth / 2, rotY: 0 });
     }
   }
 
-  // pass 2: corridors — resolve piece + rotation from orthogonal neighbor mask
-  const DIRS = [[0, -1], [1, 0], [0, 1], [-1, 0]]; // N E S W
-  const conn = (x, z) => {
-    const m = [false, false, false, false];
-    DIRS.forEach(([dx, dz], i) => {
-      const nx = x + dx, nz = z + dz;
-      if (nx >= 0 && nz >= 0 && nx < MAP_W && nz < MAP_H && walkGrid[nz][nx]) m[i] = true;
-    });
-    return m;
-  };
-  for (let z = 0; z < MAP_H; z++) for (let x = 0; x < MAP_W; x++) {
-    const ch = LAYOUT[z][x];
-    if (ch !== '-' && ch !== 'J' && ch !== 'X') continue;
-    const [n, e, s, w] = conn(x, z);
-    const count = [n, e, s, w].filter(Boolean).length;
-    let piece = 'corridor', rotY = 0;
-    if (ch === 'J' || (ch === '-' && count === 3)) {
-      piece = 'corridor-junction';
-      // default (rot 0): openings E,W,N — wall on S
-      if (!s) rotY = 0; else if (!n) rotY = Math.PI; else if (!e) rotY = Math.PI / 2; else rotY = -Math.PI / 2;
-    } else if (ch === 'X' || count === 4) {
-      piece = 'corridor-intersection';
-    } else if (count <= 1) {
-      piece = 'corridor-end'; // default opening faces +X (E)
-      if (e) rotY = 0; else if (w) rotY = Math.PI; else if (s) rotY = -Math.PI / 2; else rotY = Math.PI / 2;
-    } else if ((n && s) || (e && w)) {
-      piece = 'corridor'; // default runs E-W
-      rotY = (n && s) ? Math.PI / 2 : 0;
-    } else {
-      piece = 'corridor-corner'; // default openings E+S
-      if (e && s) rotY = 0; else if (s && w) rotY = -Math.PI / 2;
-      else if (w && n) rotY = Math.PI; else rotY = Math.PI / 2;
-    }
-    placements.push({ piece, ax: x, az: z, w: 1, h: 1, rotY, off: [0, 0, 0] });
-    claim(x, z, 1, 1);
-  }
-
-  // instantiate
   for (const p of placements) {
     const tpl = pieceTemplates[p.piece];
     if (!tpl) { console.warn('missing piece', p.piece); continue; }
     const g = new THREE.Group();
     const model = tpl.clone(true);
     model.rotation.y = p.rotY;
-    model.position.set(p.off[0], p.off[1], p.off[2]);
-    model.traverse(o => { if (o.isMesh) { o.receiveShadow = true; colliderMeshes.push(o); } });
+    model.traverse(o => { if (o.isMesh) { o.receiveShadow = true; occluderMeshes.push(o); } });
     g.add(model);
-    const cx = (p.ax + p.w / 2) * TILE - OFF_X;
-    const cz = (p.az + p.h / 2) * TILE - OFF_Z;
-    g.position.set(cx, 0, cz);
-    if (p.gate) { gateGroup = g; }
+    g.position.set(p.cx * TILE - OFF_X, 0, p.cz * TILE - OFF_Z);
+    if (p.gate) gateGroup = g;
     dungeonGroup.add(g);
   }
 
@@ -415,11 +515,16 @@ function buildDungeon() {
   buildFlag();
   buildSwitch();
   buildPlayerLight();
+  buildDebugOverlay();
+  startupPathCheck(false);
+
+  // size the minimap canvas to the map
+  $('minimap').width = MAP_W * 6;
+  $('minimap').height = MAP_H * 6;
 }
 
 function torchPositions() {
-  // room centers + junction, in tile coords
-  return [[2, 2], [9, 2], [13, 6], [23, 6], [6, 2]];
+  return [[3, 9], [3, 5], [9, 5], [13, 9], [21, 9]]; // S, junction, L, W, F
 }
 
 function buildTorches() {
@@ -431,14 +536,13 @@ function buildTorches() {
     const stick = new THREE.Mesh(stickGeo, stickMat);
     stick.position.set(p.x + 1.2, 1.9, p.z + 1.2);
     dungeonGroup.add(stick);
-    const flameMat = new THREE.MeshBasicMaterial({ color: 0xffb347 });
-    const flame = new THREE.Mesh(flameGeo, flameMat);
+    const flame = new THREE.Mesh(flameGeo, new THREE.MeshBasicMaterial({ color: 0xffb347 }));
     flame.position.set(p.x + 1.2, 2.75, p.z + 1.2);
     dungeonGroup.add(flame);
-    const light = new THREE.PointLight(0xff8c3a, 22, 20, 2);
+    const light = new THREE.PointLight(0xff8c3a, 13, 15, 2);
     light.position.copy(flame.position);
     dungeonGroup.add(light);
-    torches.push({ light, flame, base: 22, phase: Math.random() * 10 });
+    torches.push({ light, flame, base: 13, phase: Math.random() * 10 });
   }
 }
 
@@ -448,27 +552,25 @@ function buildStartRing() {
   const ring = new THREE.Mesh(geo, mat);
   ring.rotation.x = -Math.PI / 2;
   ring.position.set(startPos.x, 0.06, startPos.z);
-  ring.userData.startRing = true;
   dungeonGroup.add(ring);
   dungeonGroup.userData.startRing = ring;
 }
 
 function buildFlag() {
   const g = new THREE.Group();
-  const poleMat = new THREE.MeshStandardMaterial({ color: 0x5a3a1a, roughness: 0.7 });
-  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.09, 3.4, 10), poleMat);
+  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.09, 3.4, 10),
+    new THREE.MeshStandardMaterial({ color: 0x5a3a1a, roughness: 0.7 }));
   pole.position.y = 1.7;
   g.add(pole);
   const knob = new THREE.Mesh(new THREE.SphereGeometry(0.16, 12, 12),
     new THREE.MeshStandardMaterial({ color: 0xd8a93f, metalness: 0.9, roughness: 0.25, emissive: 0x664411, emissiveIntensity: 0.4 }));
   knob.position.y = 3.5;
   g.add(knob);
-  // waving flag: plane with sine-displaced vertices, anchored at the pole edge
   const fgeo = new THREE.PlaneGeometry(1.9, 1.05, 16, 6);
-  fgeo.translate(0.95, 0, 0); // x=0 edge at pole
-  const fmat = new THREE.MeshStandardMaterial({ color: 0xc22730, side: THREE.DoubleSide, roughness: 0.6,
-    emissive: 0x550000, emissiveIntensity: 0.35 });
-  const flag = new THREE.Mesh(fgeo, fmat);
+  fgeo.translate(0.95, 0, 0);
+  const flag = new THREE.Mesh(fgeo, new THREE.MeshStandardMaterial({
+    color: 0xc22730, side: THREE.DoubleSide, roughness: 0.6, emissive: 0x550000, emissiveIntensity: 0.35,
+  }));
   flag.position.set(0.08, 2.85, 0);
   g.add(flag);
   flagBase = fgeo.attributes.position.array.slice();
@@ -487,8 +589,10 @@ function buildSwitch() {
   base.position.y = 0.07;
   g.add(base);
   switchTop = new THREE.Mesh(new THREE.CylinderGeometry(0.68, 0.68, 0.14, 24),
-    new THREE.MeshStandardMaterial({ color: 0xcc7722, roughness: 0.4, metalness: 0.3,
-      emissive: 0xff6a00, emissiveIntensity: 0.9 }));
+    new THREE.MeshStandardMaterial({
+      color: 0xcc7722, roughness: 0.4, metalness: 0.3,
+      emissive: 0xff6a00, emissiveIntensity: 0.9,
+    }));
   switchTop.position.y = 0.2;
   g.add(switchTop);
   g.position.set(switchPos.x, 0, switchPos.z);
@@ -496,7 +600,6 @@ function buildSwitch() {
   dungeonGroup.add(g);
 }
 
-// one shadow-casting light that follows the player (shadows on player only)
 let playerLight = null;
 function buildPlayerLight() {
   playerLight = new THREE.DirectionalLight(0xfff2dd, 1.0);
@@ -510,8 +613,85 @@ function buildPlayerLight() {
   gameScene.add(playerLight.target);
 }
 
+// Debug overlay (toggle 'O'): green = walkable cells, red = blocked edges.
+function mergeGeos(geos) {
+  let vTotal = 0, iTotal = 0;
+  for (const g of geos) { vTotal += g.attributes.position.count; iTotal += g.index.count; }
+  const pos = new Float32Array(vTotal * 3), nor = new Float32Array(vTotal * 3), uv = new Float32Array(vTotal * 2);
+  const idx = new Uint16Array(iTotal);
+  let vo = 0, io = 0;
+  for (const g of geos) {
+    const n = g.attributes.position.count;
+    pos.set(g.attributes.position.array, vo * 3);
+    nor.set(g.attributes.normal.array, vo * 3);
+    uv.set(g.attributes.uv.array, vo * 2);
+    const gi = g.index.array;
+    for (let i = 0; i < gi.length; i++) idx[io + i] = gi[i] + vo;
+    vo += n; io += gi.length;
+    g.dispose();
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  out.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  out.setIndex(new THREE.BufferAttribute(idx, 1));
+  return out;
+}
+
+function buildDebugOverlay() {
+  debugOverlay = new THREE.Group();
+  debugOverlay.visible = false;
+  const greenGeos = [], redGeos = [];
+  for (let z = 0; z < MAP_H; z++) for (let x = 0; x < MAP_W; x++) {
+    if (!isWalkable(x, z)) continue;
+    const p = tileToWorld(x, z);
+    const g = new THREE.PlaneGeometry(TILE - 0.15, TILE - 0.15);
+    g.rotateX(-Math.PI / 2);
+    g.translate(p.x, 0.1, p.z);
+    greenGeos.push(g);
+    const x0 = x * TILE - OFF_X, z0 = z * TILE - OFF_Z;
+    const strip = (cx, cz, w, d) => {
+      const sg = new THREE.PlaneGeometry(w, d);
+      sg.rotateX(-Math.PI / 2);
+      sg.translate(cx, 0.14, cz);
+      redGeos.push(sg);
+    };
+    const bits = [[1 << 0, x0 + TILE - 0.08, z0 + TILE / 2, 0.16, TILE - 0.15],
+                  [1 << 1, x0 + 0.08, z0 + TILE / 2, 0.16, TILE - 0.15],
+                  [1 << 2, x0 + TILE / 2, z0 + TILE - 0.08, TILE - 0.15, 0.16],
+                  [1 << 3, x0 + TILE / 2, z0 + 0.08, TILE - 0.15, 0.16]];
+    for (const [bit, cx, cz, w, d] of bits) {
+      if (!(openE[z][x] & bit)) strip(cx, cz, w, d);
+    }
+  }
+  if (greenGeos.length) {
+    const m = new THREE.Mesh(mergeGeos(greenGeos),
+      new THREE.MeshBasicMaterial({ color: 0x2aff5a, transparent: true, opacity: 0.32, depthWrite: false }));
+    debugOverlay.add(m);
+  }
+  if (redGeos.length) {
+    const m = new THREE.Mesh(mergeGeos(redGeos),
+      new THREE.MeshBasicMaterial({ color: 0xff3344, transparent: true, opacity: 0.9, depthWrite: false }));
+    debugOverlay.add(m);
+  }
+  dungeonGroup.add(debugOverlay);
+}
+
+// Breadth-first search over the edge-based grid. With the gate forced open
+// there must be a path from start to flag, or the layout is broken.
+function startupPathCheck(verbose) {
+  if (!startCell || !flagCell) { console.error('STARTUP PATH CHECK FAILED: missing start/flag'); return null; }
+  const saved = openE[gateTile[1]][gateTile[0]];
+  openE[gateTile[1]][gateTile[0]] = gateOpenBits; // treat gate as open
+  const path = findPathCells(startCell[0], startCell[1], flagCell[0], flagCell[1]);
+  openE[gateTile[1]][gateTile[0]] = saved;
+  if (!path) console.error('STARTUP PATH CHECK FAILED: no walkable path from start to flag (gate open)');
+  else if (verbose || true) console.log(`STARTUP PATH CHECK OK: start->flag ${path.length} cells`);
+  return path;
+}
+
 /* ================= PLAYER ================= */
-const FACE_OFFSET = 0; // tweak if the character model faces away from movement
+const FACE_OFFSET = 0;
 function spawnPlayer() {
   if (player) gameScene.remove(player.group);
   const src = charCache[selectedChar].gltf;
@@ -523,7 +703,7 @@ function spawnPlayer() {
     const clip = clipByName(src, [n]);
     if (clip) actions[n] = mixer.clipAction(clip);
   }
-  player = { group, mixer, actions, yaw: Math.PI / 2 };
+  player = { group, mixer, actions, yaw: Math.PI }; // face north, toward the corridor
   group.position.copy(startPos);
   group.rotation.y = player.yaw + FACE_OFFSET;
   gameScene.add(group);
@@ -539,14 +719,185 @@ function setAnim(name) {
   if (prev && prev !== next) prev.fadeOut(0.2);
 }
 
+/* ================= A* PATHFINDING (edge-based grid) ================= */
+function findPathCells(sx, sz, tx, tz) {
+  if (!isWalkable(tx, tz) || !isWalkable(sx, sz)) return null;
+  if (sx === tx && sz === tz) return [[sx, sz]];
+  const W = MAP_W, H = MAP_H;
+  const g = new Float64Array(W * H).fill(Infinity);
+  const came = new Int32Array(W * H).fill(-1);
+  const closed = new Uint8Array(W * H);
+  const idx = (x, z) => z * W + x;
+  const h = (x, z) => Math.abs(x - tx) + Math.abs(z - tz);
+  const open = [[h(sx, sz), idx(sx, sz)]];
+  g[idx(sx, sz)] = 0;
+  while (open.length) {
+    let bi = 0;
+    for (let i = 1; i < open.length; i++) if (open[i][0] < open[bi][0]) bi = i;
+    const [, cur] = open.splice(bi, 1)[0];
+    if (closed[cur]) continue;
+    closed[cur] = 1;
+    const cx = cur % W, cz = (cur / W) | 0;
+    if (cx === tx && cz === tz) {
+      const path = [];
+      let c = cur;
+      while (c !== -1) { path.push([c % W, (c / W) | 0]); c = came[c]; }
+      return path.reverse();
+    }
+    for (let d = 0; d < 4; d++) {
+      const nx = cx + DIRS[d][0], nz = cz + DIRS[d][1];
+      if (!isWalkable(nx, nz) || !edgeOpenBetween(cx, cz, nx, nz)) continue;
+      const ni = idx(nx, nz);
+      if (closed[ni]) continue;
+      const ng = g[cur] + 1;
+      if (ng < g[ni]) { g[ni] = ng; came[ni] = cur; open.push([ng + h(nx, nz), ni]); }
+    }
+  }
+  return null;
+}
+
+// Is the straight segment between two cell centers crossable (point test;
+// the follower's collision resolves the player radius)?
+function segmentClear(ax, az, bx, bz) {
+  const x0 = (ax + 0.5) * TILE - OFF_X, z0 = (az + 0.5) * TILE - OFF_Z;
+  const x1 = (bx + 0.5) * TILE - OFF_X, z1 = (bz + 0.5) * TILE - OFF_Z;
+  const dist = Math.hypot(x1 - x0, z1 - z0);
+  const n = Math.max(1, Math.ceil(dist / (TILE * 0.25)));
+  let px = ax, pz = az;
+  for (let i = 1; i <= n; i++) {
+    const x = x0 + (x1 - x0) * i / n, z = z0 + (z1 - z0) * i / n;
+    const [cx, cz] = worldToTile(x, z);
+    if (cx !== px || cz !== pz) {
+      if (!edgeOpenBetween(px, pz, cx, cz)) return false;
+      px = cx; pz = cz;
+    }
+  }
+  return true;
+}
+
+function smoothPathCells(path) {
+  if (!path || path.length < 3) return path;
+  const out = [path[0]];
+  let i = 0;
+  while (i < path.length - 1) {
+    let j = path.length - 1;
+    while (j > i + 1 && !segmentClear(path[i][0], path[i][1], path[j][0], path[j][1])) j--;
+    out.push(path[j]);
+    i = j;
+  }
+  return out;
+}
+
+/* ================= CLICK-TO-MOVE ================= */
+function startClickMove(worldPoint) {
+  clearClickMove();
+  let [tx, tz] = worldToTile(worldPoint.x, worldPoint.z);
+  if (!isWalkable(tx, tz)) {
+    // nearest walkable cell within 3
+    let best = null, bd = 1e9;
+    for (let dz = -3; dz <= 3; dz++) for (let dx = -3; dx <= 3; dx++) {
+      const nx = tx + dx, nz = tz + dz;
+      if (!isWalkable(nx, nz)) continue;
+      const d = dx * dx + dz * dz;
+      if (d < bd) { bd = d; best = [nx, nz]; }
+    }
+    if (!best) { toast('NO PATH THERE'); return; }
+    [tx, tz] = best;
+  }
+  const [sx, sz] = worldToTile(player.group.position.x, player.group.position.z);
+  const raw = findPathCells(sx, sz, tx, tz);
+  if (!raw) { toast('NO PATH THERE'); return; }
+  const cells = smoothPathCells(raw);
+  clickPath = cells.map(([cx, cz]) => tileToWorld(cx, cz));
+  // aim the final waypoint at the actual clicked point, clamped into its cell
+  const last = clickPath[clickPath.length - 1];
+  last.x = THREE.MathUtils.clamp(worldPoint.x, last.x - TILE / 2 + 0.4, last.x + TILE / 2 - 0.4);
+  last.z = THREE.MathUtils.clamp(worldPoint.z, last.z - TILE / 2 + 0.4, last.z + TILE / 2 - 0.4);
+  clickIdx = 0;
+  clickPoint = last.clone();
+  showClickMarker(clickPoint, clickPath);
+}
+
+function clearClickMove() {
+  clickPath = null; clickIdx = 0; clickPoint = null;
+  if (clickMarker) clickMarker.visible = false;
+  if (pathLine) pathLine.visible = false;
+}
+
+function showClickMarker(point, waypoints) {
+  if (!clickMarker) {
+    const m = new THREE.Mesh(
+      new THREE.RingGeometry(0.35, 0.55, 32),
+      new THREE.MeshBasicMaterial({ color: 0x7CFC00, transparent: true, opacity: 0.9, side: THREE.DoubleSide })
+    );
+    m.rotation.x = -Math.PI / 2;
+    clickMarker = m;
+    gameScene.add(m);
+  }
+  clickMarker.position.set(point.x, 0.12, point.z);
+  clickMarker.visible = true;
+  if (!pathLine) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
+    pathLine = new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0x7CFC00, transparent: true, opacity: 0.35 }));
+    pathLine.frustumCulled = false;
+    gameScene.add(pathLine);
+  }
+  const p = player.group.position;
+  const pts = [p.x, 0.15, p.z];
+  for (const w of waypoints) pts.push(w.x, 0.15, w.z);
+  pathLine.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  pathLine.visible = true;
+}
+
+/* ================= COLLISION (edge-based, axis-separated) ================= */
+const EPS = 1e-4;
+// Move along one axis; clamp the player circle at blocked edges so it slides.
+// The swept circle (radius R) is tested against every grid line it can reach;
+// a blocked edge stops the circle R short of the line.
+function collideAxis(axis, delta) {
+  const p = player.group.position;
+  if (!delta) return;
+  const horiz = axis === 'x';
+  const offM = horiz ? OFF_X : OFF_Z; // moving axis
+  const offF = horiz ? OFF_Z : OFF_X; // fixed axis
+  const from = horiz ? p.x : p.z;
+  let target = from + delta;
+  const fixed = horiz ? p.z : p.x;
+  const dir = Math.sign(delta);
+  const R = PLAYER_RADIUS;
+  const lo = dir > 0 ? from - R : target - R;
+  const hi = dir > 0 ? target + R : from + R;
+  const kMin = Math.ceil((lo + offM) / TILE - 1e-9);
+  const kMax = Math.floor((hi + offM) / TILE + 1e-9);
+  const c0 = Math.floor((fixed - R + offF) / TILE), c1 = Math.floor((fixed + R + offF) / TILE);
+  for (let k = kMin; k <= kMax; k++) {
+    const L = k * TILE - offM; // world coord of the grid line
+    if (dir > 0 && L < from - R + 1e-4) continue; // behind us
+    if (dir < 0 && L > from + R - 1e-4) continue; // behind us
+    for (let c = c0; c <= c1; c++) {
+      let ax, az, bx, bz;
+      if (horiz) { ax = dir > 0 ? k - 1 : k; az = c; bx = dir > 0 ? k : k - 1; bz = c; }
+      else { ax = c; az = dir > 0 ? k - 1 : k; bx = c; bz = dir > 0 ? k : k - 1; }
+      if (!edgeOpenBetween(ax, az, bx, bz)) {
+        if (dir > 0) target = Math.min(target, L - R - EPS);
+        else target = Math.max(target, L + R + EPS);
+      }
+    }
+  }
+  if (horiz) p.x = target; else p.z = target;
+}
+
 /* ================= INPUT ================= */
+const _rc = new THREE.Raycaster();
+const _ndc = new THREE.Vector2();
 function wireGameInput() {
   const el = renderer.domElement;
   addEventListener('keydown', e => {
-    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
     if (state !== 'playing' || won) return;
     keys[e.code] = true;
-    if (/^(KeyW|KeyA|KeyS|KeyD|Arrow)/.test(e.code)) clickTarget = null;
+    if (/^(KeyW|KeyA|KeyS|KeyD|Arrow)/.test(e.code)) clearClickMove();
     if (e.code === 'KeyO') toggleDebugOrbit();
   });
   addEventListener('keyup', e => { keys[e.code] = false; });
@@ -559,20 +910,22 @@ function wireGameInput() {
     if (state !== 'playing' || won || !downPos || !e.buttons) return;
     camYaw -= e.movementX * 0.0052;
     camPitch = THREE.MathUtils.clamp(camPitch + e.movementY * 0.004, 0.08, 1.25);
+    lastDragT = performance.now() / 1000;
   });
   el.addEventListener('pointerup', e => {
     if (state !== 'playing' || won || !downPos) return;
     const dx = e.clientX - downPos[0], dy = e.clientY - downPos[1];
     downPos = null;
     if (dx * dx + dy * dy > 36) return; // it was a drag
-    // click-to-move: raycast onto the floor plane
-    selectPointer.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
-    selectRaycaster.setFromCamera(selectPointer, gameCamera);
-    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-    const hit = new THREE.Vector3();
-    if (selectRaycaster.ray.intersectPlane(plane, hit)) {
-      const [tx, tz] = worldToTile(hit.x, hit.z);
-      if (isWalkable(tx, tz)) { clickTarget = hit.clone(); clickTarget.y = 0; }
+    // click-to-move: raycast against dungeon meshes, accept upward faces (floors)
+    _ndc.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+    _rc.setFromCamera(_ndc, gameCamera);
+    const hits = _rc.intersectObjects(dungeonGroup.children, true);
+    const n = new THREE.Vector3();
+    for (const h of hits) {
+      if (!h.face) continue;
+      n.copy(h.face.normal).transformDirection(h.object.matrixWorld);
+      if (n.y > 0.55) { startClickMove(h.point); break; }
     }
   });
   el.addEventListener('wheel', e => {
@@ -588,77 +941,72 @@ function toggleDebugOrbit() {
     debugOrbit.enableDamping = true;
   }
   if (debugOrbit) debugOrbit.enabled = debugOn;
-  toast(debugOn ? 'DEBUG CAMERA ON (O TO EXIT)' : 'DEBUG CAMERA OFF');
-}
-
-/* ================= COLLISION (walkable-cell grid, no physics lib) ================= */
-const _clamp = THREE.MathUtils.clamp;
-function collide(pos) {
-  for (let iter = 0; iter < 2; iter++) {
-    const tx0 = Math.floor((pos.x - PLAYER_RADIUS + OFF_X) / TILE);
-    const tz0 = Math.floor((pos.z - PLAYER_RADIUS + OFF_Z) / TILE);
-    const tx1 = Math.floor((pos.x + PLAYER_RADIUS + OFF_X) / TILE);
-    const tz1 = Math.floor((pos.z + PLAYER_RADIUS + OFF_Z) / TILE);
-    for (let tz = tz0; tz <= tz1; tz++) for (let tx = tx0; tx <= tx1; tx++) {
-      if (isWalkable(tx, tz)) continue;
-      const minX = tx * TILE - OFF_X, maxX = minX + TILE;
-      const minZ = tz * TILE - OFF_Z, maxZ = minZ + TILE;
-      const cx = _clamp(pos.x, minX, maxX), cz = _clamp(pos.z, minZ, maxZ);
-      const dx = pos.x - cx, dz = pos.z - cz;
-      const d2 = dx * dx + dz * dz;
-      if (d2 < PLAYER_RADIUS * PLAYER_RADIUS) {
-        if (d2 > 1e-9) {
-          const d = Math.sqrt(d2), push = (PLAYER_RADIUS - d) / d;
-          pos.x += dx * push; pos.z += dz * push;
-        } else { pos.x += PLAYER_RADIUS; }
-      }
-    }
-  }
+  if (debugOverlay) debugOverlay.visible = debugOn;
+  toast(debugOn ? 'DEBUG VIEW ON (O TO EXIT)' : 'DEBUG VIEW OFF');
 }
 
 /* ================= GAME UPDATE ================= */
-const _v1 = new THREE.Vector3(), _v2 = new THREE.Vector3();
-const _ray = new THREE.Raycaster();
+const _v1 = new THREE.Vector3(), _v2 = new THREE.Vector3(), _v3 = new THREE.Vector3();
+const _ocDir = new THREE.Vector3(), _n = new THREE.Vector3();
 
 function updateGame(dt, t) {
   const p = player.group.position;
 
-  // --- movement ---
-  let mvx = 0, mvz = 0, sprinting = false;
+  // --- movement: keys (camera-relative) or A* click path ---
+  let mvx = 0, mvz = 0, keyMoving = false;
+  const sprinting = !!(keys.ShiftLeft || keys.ShiftRight);
   if (state === 'playing' && !won) {
-    const fx = -Math.sin(camYaw), fz = -Math.cos(camYaw); // camera forward on ground
-    const rx = -fz, rz = fx;                              // camera right
+    const fx = -Math.sin(camYaw), fz = -Math.cos(camYaw);
+    const rx = -fz, rz = fx;
     const fwd = (keys.KeyW || keys.ArrowUp ? 1 : 0) - (keys.KeyS || keys.ArrowDown ? 1 : 0);
     const str = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
-    mvx = fx * fwd + rx * str; mvz = fz * fwd + rz * str;
-    sprinting = !!(keys.ShiftLeft || keys.ShiftRight);
-    if (clickTarget) {
-      const dx = clickTarget.x - p.x, dz = clickTarget.z - p.z;
+    if (fwd || str) {
+      mvx = fx * fwd + rx * str; mvz = fz * fwd + rz * str;
+      keyMoving = true;
+    } else if (clickPath) {
+      const wp = clickPath[clickIdx];
+      const dx = wp.x - p.x, dz = wp.z - p.z;
       const d = Math.hypot(dx, dz);
-      if (d < 0.35) clickTarget = null;
-      else { mvx = dx / d; mvz = dz / d; }
+      if (d < 0.45) {
+        clickIdx++;
+        if (clickIdx >= clickPath.length) clearClickMove();
+      } else { mvx = dx / d; mvz = dz / d; }
     }
     const mlen = Math.hypot(mvx, mvz);
     if (mlen > 0.01) {
-      const sp = (sprinting && !clickTarget ? SPRINT_SPEED : (clickTarget ? WALK_SPEED : (sprinting ? SPRINT_SPEED : WALK_SPEED)));
+      const sp = sprinting ? SPRINT_SPEED : WALK_SPEED;
       const nx = mvx / mlen, nz = mvz / mlen;
       _v1.set(p.x, 0, p.z);
-      p.x += nx * sp * dt; p.z += nz * sp * dt;
-      collide(p);
+      collideAxis('x', nx * sp * dt); // axis-separated: slides along walls
+      collideAxis('z', nz * sp * dt);
       const moved = Math.hypot(p.x - _v1.x, p.z - _v1.z);
       totalDist += moved;
       stepCount = Math.floor(totalDist / STEP_LENGTH);
-      if (clickTarget && moved < sp * dt * 0.25) clickTarget = null; // blocked
-      // face movement
       const targetYaw = Math.atan2(nx, nz);
-      let d = targetYaw - player.yaw;
-      d = Math.atan2(Math.sin(d), Math.cos(d));
-      player.yaw += d * Math.min(1, dt * 11);
+      let dy = targetYaw - player.yaw;
+      dy = Math.atan2(Math.sin(dy), Math.cos(dy));
+      player.yaw += dy * Math.min(1, dt * 11);
       player.group.rotation.y = player.yaw + FACE_OFFSET;
       setAnim(sprinting ? 'sprint' : 'walk');
+      // camera slowly follows the player's facing when the mouse isn't driving
+      const now = performance.now() / 1000;
+      if (keyMoving && now - lastDragT > 1.5) {
+        const want = player.yaw + Math.PI; // behind the player
+        let dd = want - camYaw;
+        dd = Math.atan2(Math.sin(dd), Math.cos(dd));
+        camYaw += THREE.MathUtils.clamp(dd, -1.4 * dt, 1.4 * dt);
+      }
     } else setAnim('idle');
   }
   player.mixer.update(dt);
+
+  // --- fog of war: mark nearby cells visited ---
+  {
+    const [pcx, pcz] = worldToTile(p.x, p.z);
+    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+      if (inBounds(pcx + dx, pcz + dz)) visited[pcz + dz][pcx + dx] = true;
+    }
+  }
 
   // --- switch + gate ---
   if (!switchOn && state === 'playing') {
@@ -672,10 +1020,9 @@ function updateGame(dt, t) {
   }
   if (switchOn && gateAnim < 1) {
     gateAnim = Math.min(1, gateAnim + dt / 1.4);
-    const e = gateAnim * gateAnim;
-    gateGroup.position.y = -4.4 * e;
+    gateGroup.position.y = -4.4 * gateAnim * gateAnim;
     if (gateAnim >= 1) {
-      walkGrid[gateTile[1]][gateTile[0]] = true;
+      openE[gateTile[1]][gateTile[0]] = gateOpenBits;
       gateOpen = true;
       toast('THE GATE IS OPEN');
     }
@@ -698,7 +1045,6 @@ function updateGame(dt, t) {
     pos.needsUpdate = true;
     flagMesh.geometry.computeVertexNormals();
   }
-  // --- start ring pulse ---
   const ring = dungeonGroup.userData.startRing;
   if (ring) ring.material.opacity = 0.55 + Math.sin(t * 3) * 0.3;
 
@@ -706,7 +1052,6 @@ function updateGame(dt, t) {
   playerLight.position.set(p.x + 6, 12, p.z + 4);
   playerLight.target.position.set(p.x, 0, p.z);
 
-  // --- camera ---
   updateCamera(dt);
 
   // --- HUD ---
@@ -716,14 +1061,15 @@ function updateGame(dt, t) {
     $('steps').textContent = stepCount + ' STEPS';
   }
   drawMinimap();
-  updateHintArrow();
+  updateHintArrow(dt);
   if (toastTimer > 0) { toastTimer -= dt; if (toastTimer <= 0) $('toast').style.opacity = '0'; }
 
-  // --- win check ---
+  // --- win check: must actually reach the flag ---
   if (state === 'playing' && !won) {
     const d = Math.hypot(p.x - flagPos.x, p.z - flagPos.z);
-    if (d < TILE) {
+    if (d < WIN_DIST) {
       won = true; winTimer = 1.6;
+      clearClickMove();
       const em = player.actions['emote-yes'];
       if (em) {
         const prev = player.actions[animState];
@@ -732,7 +1078,6 @@ function updateGame(dt, t) {
         em.fadeIn(0.25).play();
         animState = 'emote-yes';
       }
-      clickTarget = null;
     }
   } else if (won && state === 'playing') {
     winTimer -= dt;
@@ -740,6 +1085,27 @@ function updateGame(dt, t) {
   }
 }
 
+// Camera: 3/4 top-down follow view. Walls between camera and player fade out
+// instead of snapping the camera forward. Floor faces are skipped by the check.
+const fadedMats = new Map(); // mesh -> {orig, faded}
+let occludeTick = 0, occlSpheres = null;
+// Only raycast meshes near the head->camera segment (perf: pieces are big).
+function occlusionCandidates(head, desired) {
+  if (!occlSpheres) {
+    occlSpheres = occluderMeshes.map(m => {
+      const s = new THREE.Sphere();
+      new THREE.Box3().setFromObject(m).getBoundingSphere(s);
+      return s;
+    });
+  }
+  const near = [];
+  const r2 = (camDist + 7) * (camDist + 7);
+  for (let i = 0; i < occluderMeshes.length; i++) {
+    const c = occlSpheres[i].center;
+    if (c.distanceToSquared(head) < r2 || c.distanceToSquared(desired) < 49) near.push(occluderMeshes[i]);
+  }
+  return near;
+}
 function updateCamera(dt) {
   if (debugOn && debugOrbit) {
     debugOrbit.target.copy(player.group.position); debugOrbit.target.y += 1.2;
@@ -748,15 +1114,44 @@ function updateCamera(dt) {
   }
   const p = player.group.position;
   _v1.set(p.x, p.y + 1.7, p.z); // head
-  const cp = Math.cos(camPitch), sp2 = Math.sin(camPitch);
-  _v2.set(Math.sin(camYaw) * cp, sp2, Math.cos(camYaw) * cp); // head -> camera dir
-  _ray.set(_v1, _v2); _ray.far = camDist;
-  const hits = _ray.intersectObjects(colliderMeshes, false);
-  let d = camDist;
-  if (hits.length) d = Math.max(1.7, hits[0].distance - 0.45);
-  _v2.multiplyScalar(d).add(_v1);
-  gameCamera.position.lerp(_v2, 1 - Math.pow(0.0001, dt));
+  const cp = Math.cos(camPitch), sp = Math.sin(camPitch);
+  _v2.set(Math.sin(camYaw) * cp, sp, Math.cos(camYaw) * cp); // head -> camera
+  _v3.copy(_v2).multiplyScalar(camDist).add(_v1); // desired camera pos
+
+  if ((occludeTick++ % 6) === 0) {
+    _ocDir.copy(_v3).sub(_v1);
+    const dist = _ocDir.length();
+    _ocDir.normalize();
+    _rc.set(_v1, _ocDir);
+    _rc.far = dist;
+    const hits = _rc.intersectObjects(occlusionCandidates(_v1, _v3), false);
+    const want = new Set();
+    for (const h of hits) {
+      if (!h.face) continue;
+      _n.copy(h.face.normal).transformDirection(h.object.matrixWorld);
+      if (_n.y <= 0.5) want.add(h.object); // skip floors
+    }
+    for (const m of want) {
+      if (!fadedMats.has(m)) {
+        const orig = m.material;
+        const fm = orig.clone();
+        fm.transparent = true; fm.opacity = 0.15; fm.depthWrite = false;
+        fadedMats.set(m, { orig, faded: fm });
+        m.material = fm;
+      }
+    }
+    for (const [m, rec] of fadedMats) {
+      if (!want.has(m)) { m.material = rec.orig; fadedMats.delete(m); }
+    }
+    _rc.far = Infinity;
+  }
+  gameCamera.position.lerp(_v3, 1 - Math.pow(0.0001, dt));
   gameCamera.lookAt(_v1);
+}
+
+function restoreFaded() {
+  for (const [m, rec] of fadedMats) m.material = rec.orig;
+  fadedMats.clear();
 }
 
 /* ================= HUD ================= */
@@ -771,41 +1166,89 @@ function toast(msg, dur = 2.6) {
 }
 const mm = $('minimap').getContext('2d');
 function drawMinimap() {
-  const s = 6;
-  mm.clearRect(0, 0, 156, 54);
+  const s = 6, W = MAP_W * s, H = MAP_H * s;
+  mm.clearRect(0, 0, W, H);
   for (let z = 0; z < MAP_H; z++) for (let x = 0; x < MAP_W; x++) {
-    if (!walkGrid[z][x]) continue;
-    mm.fillStyle = '#4d465e';
+    const k = cellKind[z][x];
+    if (k !== 'room' && k !== 'corr' && k !== 'gate') continue;
+    const v = visited[z][x];
+    mm.globalAlpha = v ? 1 : 0; // hide unvisited areas
+    if (!v) continue;
+    mm.fillStyle = k === 'room' ? '#5a4f7a' : '#4d465e';
     mm.fillRect(x * s, z * s, s - 0.5, s - 0.5);
   }
-  if (gateTile) {
-    mm.fillStyle = gateOpen ? '#3fd06a' : '#d04848';
-    mm.fillRect(gateTile[0] * s, gateTile[1] * s, s - 0.5, s - 0.5);
+  mm.globalAlpha = 1;
+  // doorways: gold ticks on room borders
+  mm.fillStyle = '#ffd94d';
+  for (const R of rooms) {
+    for (let d = 0; d < 4; d++) for (const ti of R.doors[d]) {
+      let x, z, horiz;
+      if (d === 0) { x = R.x0 + R.w - 1; z = R.z0 + ti; horiz = false; }
+      else if (d === 1) { x = R.x0; z = R.z0 + ti; horiz = false; }
+      else if (d === 2) { x = R.x0 + ti; z = R.z0 + R.h - 1; horiz = true; }
+      else { x = R.x0 + ti; z = R.z0; horiz = true; }
+      if (!visited[z][x]) continue;
+      if (horiz) mm.fillRect(x * s + 1, (d === 2 ? z + 1 : z) * s - 1, s - 2, 2);
+      else mm.fillRect((d === 0 ? x + 1 : x) * s - 1, z * s + 1, 2, s - 2);
+    }
   }
-  if (switchPos && !switchOn) {
-    const [tx, tz] = worldToTile(switchPos.x, switchPos.z);
+  // gate
+  if (gateTile) {
+    const v = visited[gateTile[1]][gateTile[0]];
+    mm.globalAlpha = v ? 1 : 0.3;
+    mm.fillStyle = gateOpen ? '#3fd06a' : '#d04848';
+    mm.fillRect(gateTile[0] * s + 1, gateTile[1] * s + 1, s - 2, s - 2);
+    mm.globalAlpha = 1;
+  }
+  // switch
+  if (switchCell && !switchOn) {
+    const v = visited[switchCell[1]][switchCell[0]];
+    mm.globalAlpha = v ? 1 : 0.3;
     mm.fillStyle = '#ff9a2a';
-    mm.fillRect(tx * s + 1, tz * s + 1, s - 2.5, s - 2.5);
+    mm.fillRect(switchCell[0] * s + 1.5, switchCell[1] * s + 1.5, s - 3, s - 3);
+    mm.globalAlpha = 1;
   }
   // flag
-  const [fx, fz] = worldToTile(flagPos.x, flagPos.z);
-  mm.fillStyle = '#ffd94d';
-  mm.beginPath();
-  mm.moveTo(fx * s + 3, fz * s + 0.5); mm.lineTo(fx * s + 3, fz * s + 5.5); mm.lineTo(fx * s + 6, fz * s + 3);
-  mm.closePath(); mm.fill();
-  // player
+  if (flagCell) {
+    const v = visited[flagCell[1]][flagCell[0]];
+    mm.globalAlpha = v ? 1 : 0.3;
+    mm.fillStyle = '#ffd94d';
+    mm.beginPath();
+    mm.moveTo(flagCell[0] * s + 3, flagCell[1] * s + 0.5);
+    mm.lineTo(flagCell[0] * s + 3, flagCell[1] * s + 5.5);
+    mm.lineTo(flagCell[0] * s + 6, flagCell[1] * s + 3);
+    mm.closePath(); mm.fill();
+    mm.globalAlpha = 1;
+  }
+  // player + facing
   const p = player.group.position;
+  const px = (p.x + OFF_X) / TILE * s, pz = (p.z + OFF_Z) / TILE * s;
   mm.fillStyle = '#ffffff';
-  mm.beginPath();
-  mm.arc((p.x + OFF_X) / TILE * s, (p.z + OFF_Z) / TILE * s, 2.2, 0, 7);
-  mm.fill();
+  mm.beginPath(); mm.arc(px, pz, 2.4, 0, 7); mm.fill();
+  mm.strokeStyle = '#ffffff'; mm.lineWidth = 1.5;
+  mm.beginPath(); mm.moveTo(px, pz);
+  mm.lineTo(px + Math.sin(player.yaw) * 5, pz + Math.cos(player.yaw) * 5); mm.stroke();
 }
-function updateHintArrow() {
-  const p = player.group.position;
-  const b = Math.atan2(flagPos.x - p.x, flagPos.z - p.z);
-  const f = Math.atan2(-Math.sin(camYaw), -Math.cos(camYaw));
-  let rel = b - f;
-  $('hintarrow').style.transform = `rotate(${-rel}rad)`;
+
+// Hint arrow follows the next step of the A* path (to switch, then to flag).
+function updateHintArrow(dt) {
+  hintTimer -= dt;
+  if (hintTimer > 0) return;
+  hintTimer = 0.5;
+  hintDir = null;
+  if (state === 'playing' && !won) {
+    const [sx, sz] = worldToTile(player.group.position.x, player.group.position.z);
+    const target = gateOpen ? flagCell : switchCell;
+    const path = target && findPathCells(sx, sz, target[0], target[1]);
+    if (path && path.length > 1) {
+      const [nx, nz] = path[1];
+      hintDir = Math.atan2(nx - sx, nz - sz);
+    }
+  }
+  if (hintDir === null) { $('hintarrow').style.opacity = '0.25'; return; }
+  $('hintarrow').style.opacity = '1';
+  const f = Math.atan2(-Math.sin(camYaw), -Math.cos(camYaw)); // camera forward
+  $('hintarrow').style.transform = `rotate(${-(hintDir - f)}rad)`;
 }
 
 /* ================= FLOW ================= */
@@ -819,21 +1262,40 @@ function wireUI() {
   $('changeBtn').addEventListener('click', () => toSelect());
 }
 
+function resetRunState() {
+  gateOpen = false; gateAnim = 0; switchOn = false;
+  openE[gateTile[1]][gateTile[0]] = 0;
+  gateGroup.position.y = 0;
+  switchTop.position.y = 0.2; switchTop.material.emissive.setHex(0xff6a00);
+  visited = Array.from({ length: MAP_H }, () => new Array(MAP_W).fill(false));
+  clearClickMove();
+  restoreFaded();
+}
+
+function placeCameraBehindPlayer() {
+  camYaw = player.yaw + Math.PI;
+  camPitch = CAM_PITCH; camDist = CAM_DIST;
+  const p = player.group.position;
+  const cp = Math.cos(camPitch), sp = Math.sin(camPitch);
+  gameCamera.position.set(
+    p.x + Math.sin(camYaw) * cp * camDist,
+    p.y + 1.7 + sp * camDist,
+    p.z + Math.cos(camYaw) * cp * camDist
+  );
+  gameCamera.lookAt(p.x, p.y + 1.7, p.z);
+}
+
 function startGame() {
   $('fader').style.opacity = '1';
   setTimeout(() => {
     if (!gameScene) buildDungeon();
-    // gate starts closed
-    gateOpen = false; gateAnim = 0; switchOn = false;
-    walkGrid[gateTile[1]][gateTile[0]] = false;
-    if (gateGroup) gateGroup.position.y = 0;
-    if (switchTop) { switchTop.position.y = 0.2; switchTop.material.emissive.setHex(0xff6a00); }
+    resetRunState();
     spawnPlayer();
-    camYaw = -Math.PI / 2; camPitch = 0.42; camDist = CAM_DIST;
-    gameCamera.position.copy(startPos).add(new THREE.Vector3(-9, 6, 0));
+    placeCameraBehindPlayer();
     debugOn = false; if (debugOrbit) debugOrbit.enabled = false;
+    if (debugOverlay) debugOverlay.visible = false;
     startTime = performance.now(); elapsed = 0; totalDist = 0; stepCount = 0;
-    won = false; clickTarget = null; keys = {};
+    won = false; keys = {}; hintTimer = 0;
     state = 'playing';
     activeScene = gameScene; activeCamera = gameCamera;
     $('select').classList.add('hidden');
@@ -845,16 +1307,13 @@ function startGame() {
 }
 
 function resetGame() {
-  gateOpen = false; gateAnim = 0; switchOn = false;
-  walkGrid[gateTile[1]][gateTile[0]] = false;
-  gateGroup.position.y = 0;
-  switchTop.position.y = 0.2; switchTop.material.emissive.setHex(0xff6a00);
+  resetRunState();
   player.group.position.copy(startPos);
-  player.yaw = Math.PI / 2; player.group.rotation.y = player.yaw + FACE_OFFSET;
+  player.yaw = Math.PI; player.group.rotation.y = player.yaw + FACE_OFFSET;
   setAnim('idle');
-  camYaw = -Math.PI / 2; camPitch = 0.42;
+  placeCameraBehindPlayer();
   startTime = performance.now(); elapsed = 0; totalDist = 0; stepCount = 0;
-  won = false; clickTarget = null;
+  won = false; keys = {}; hintTimer = 0;
   state = 'playing';
   $('win').classList.add('hidden');
   $('hud').classList.remove('hidden');
@@ -883,18 +1342,59 @@ function showWin() {
 function tick() {
   const dt = Math.min(clock.getDelta(), 0.05);
   const t = clock.elapsedTime;
-  if (state === 'select') updateSelect(dt, t);
+  if (state === 'select') updateSelect(dt);
   else if (gameScene) updateGame(dt, t);
   renderer.render(activeScene, activeCamera);
 }
 
-// tiny debug/testing handle
+// debug/testing handle
 window.__game = {
   get state() { return state; },
   get selected() { return selectedChar; },
+  get charCount() { return selectChars.length; },
+  get gateOpen() { return gateOpen; },
+  get switchOn() { return switchOn; },
   playerPos: () => player ? player.group.position.toArray() : null,
   flagPos: () => flagPos ? flagPos.toArray() : null,
+  switchPos: () => switchPos ? switchPos.toArray() : null,
+  gatePos: () => gateTile ? tileToWorld(gateTile[0], gateTile[1]).toArray() : null,
   tileSize: () => TILE,
+  worldOf: (tx, tz) => tileToWorld(tx, tz).toArray(),
+  cellOf: (x, z) => worldToTile(x, z),
+  walkableAt: (x, z) => { const [tx, tz] = worldToTile(x, z); return isWalkable(tx, tz); },
+  edgesAt: (tx, tz) => (inBounds(tx, tz) ? openE[tz][tx] : -1),
+  pathCells: (sx, sz, tx, tz) => findPathCells(sx, sz, tx, tz),
+  teleport: (x, z) => { if (player) { player.group.position.set(x, 0, z); clearClickMove(); } },
+  setCamYaw: y => { camYaw = y; },
+  // deterministic collision test hook: move exactly (dx,dz) through collideAxis
+  nudge: (dx, dz) => { if (player) { collideAxis('x', dx); collideAxis('z', dz); } },
+  clickAt: (x, z) => startClickMove(new THREE.Vector3(x, 0, z)),
+  hasPath: () => !!clickPath,
+  bfs: () => startupPathCheck(true),
+  rooms: () => rooms.map(r => ({ ...r })),
+  kindMap: () => cellKind.map(row => row.map(k => k ? k[0] : '.').join('')).join('\n'),
+  layout: () => LAYOUT.slice(),
+  sceneInfo: () => {
+    let tris = 0, meshes = 0, lights = 0;
+    gameScene.traverse(o => {
+      if (o.isMesh) {
+        meshes++;
+        const g = o.geometry;
+        tris += (g.index ? g.index.count : g.attributes.position.count) / 3;
+      }
+      if (o.isLight) lights++;
+    });
+    return { tris: Math.round(tris), meshes, lights, drawHint: renderer.info.render.calls };
+  },
+  hideDungeon: h => { if (dungeonGroup) dungeonGroup.visible = !h; },
+  get debugOn() { return debugOn; },
+  overlayInfo: () => {
+    if (!debugOverlay) return null;
+    return debugOverlay.children.map(m => ({
+      quads: m.geometry.index.count / 6,
+      color: '#' + m.material.color.getHexString(),
+    }));
+  },
   choose: i => chooseCharacter(CHARACTERS[i]),
   start: () => startGame(),
 };

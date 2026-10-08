@@ -12,6 +12,14 @@
 
 ![JavaScript](https://img.shields.io/badge/language-JavaScript-F7DF1E) ![Three.js](https://img.shields.io/badge/three.js-0.160-000000)
 
+## Screenshots
+
+<p align="center">
+  <img src="./screenshot-ui.png" alt="Dungeon Delve — character selection screen" width="100%" />
+  <br />
+  <em>Character selection screen — pick your delver and enter the dungeon.</em>
+</p>
+
 ## What it is
 
 **Dungeon Delve** is a tiny, self-contained 3D dungeon crawler that runs in the browser. The dungeon is procedurally assembled from a hand-written ASCII map using the Kenney modular dungeon kit (GLB models), the player picks from 18 Kenney characters, then explores a room-and-corridor dungeon to reach the finish flag. All 3D assets are local to the repo; only Three.js itself loads from a CDN. The entire game is two files: `index.html` (UI) + `main.js` (1,400 lines of game logic).
